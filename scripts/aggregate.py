@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-import math
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -14,6 +14,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
+from typing import Iterator
 
 ORG = os.environ["ORG"]
 TOKEN = os.environ["GH_TOKEN"]
@@ -29,79 +30,66 @@ HEADERS = {
 }
 
 
-def api_get(path: str, params: dict | None = None):
-    url = f"{API}{path}"
+_LINK_NEXT = re.compile(r'<([^>]+)>;\s*rel="next"')
+WEEK_SEC = 7 * 24 * 3600
+# Legitimate "no resource here" responses — not errors for our purpose.
+_SOFT_MISS = {404, 409, 451}
+
+
+def api_request(url_or_path: str, params: dict | None = None):
+    """GET a GitHub API resource. Returns (status, headers, data).
+
+    Handles two kinds of protocol-defined waits:
+      - Secondary rate limit (Retry-After)
+      - Primary rate limit exhausted (x-ratelimit-remaining == "0")
+
+    These are cooperative pauses, not fallbacks. All other non-2xx
+    responses either return soft-miss (404/409/451) or propagate.
+    """
+    url = url_or_path if url_or_path.startswith("http") else f"{API}{url_or_path}"
     if params:
         url += "?" + urllib.parse.urlencode(params)
-    last_err: Exception | None = None
-    for attempt in range(6):
+    while True:
         req = urllib.request.Request(url, headers=HEADERS)
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
-                status = r.status
                 body = r.read()
-                if status == 202:
-                    # Stats are being computed; wait and retry.
-                    time.sleep(2 + attempt * 2)
-                    continue
-                return status, json.loads(body) if body else None
+                return r.status, dict(r.headers), json.loads(body) if body else None
         except urllib.error.HTTPError as e:
-            last_err = e
-            if e.code == 404:
-                return 404, None
-            if e.code in (403, 429):
+            retry_after = e.headers.get("retry-after")
+            if retry_after and retry_after.isdigit():
+                wait = min(int(retry_after) + 1, 3600)
+                print(f"  secondary rate limit, waiting {wait}s", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            if e.code in (403, 429) and e.headers.get("x-ratelimit-remaining") == "0":
                 reset = e.headers.get("x-ratelimit-reset")
-                wait = 10
+                wait = 60
                 if reset and reset.isdigit():
-                    wait = max(5, int(reset) - int(time.time()) + 2)
-                print(f"  rate limited, sleeping {wait}s", file=sys.stderr)
-                time.sleep(min(wait, 120))
+                    wait = max(1, int(reset) - int(time.time()) + 1)
+                print(f"  rate limit exhausted, waiting {wait}s", file=sys.stderr)
+                time.sleep(min(wait, 3600))
                 continue
-            if 500 <= e.code < 600:
-                time.sleep(2 + attempt * 2)
-                continue
+            if e.code in _SOFT_MISS:
+                return e.code, dict(e.headers), None
             raise
-        except urllib.error.URLError as e:
-            last_err = e
-            time.sleep(2 + attempt * 2)
-    if last_err:
-        print(f"  giving up on {path}: {last_err}", file=sys.stderr)
-    return 0, None
 
 
-def list_repos() -> list[dict]:
-    repos: list[dict] = []
-    page = 1
-    while True:
-        status, data = api_get(
-            f"/orgs/{ORG}/repos",
-            {"per_page": 100, "page": page, "type": "all"},
-        )
-        if not data:
-            break
-        repos.extend(data)
-        if len(data) < 100:
-            break
-        page += 1
-    return repos
-
-
-def contributors(repo: str) -> list[dict]:
-    status, data = api_get(f"/repos/{ORG}/{repo}/stats/contributors")
-    if not data:
-        return []
-    return data
-
-
-def weekly_activity(repo: str) -> list[dict]:
-    status, data = api_get(f"/repos/{ORG}/{repo}/stats/commit_activity")
-    if not data:
-        return []
-    return data
+def paginate(path: str, params: dict | None = None) -> Iterator[dict]:
+    """Yield items across all pages using the Link header for navigation."""
+    merged = {"per_page": 100, **(params or {})}
+    _, headers, data = api_request(path, merged)
+    while data:
+        for item in data:
+            yield item
+        m = _LINK_NEXT.search(headers.get("Link", ""))
+        if not m:
+            return
+        _, headers, data = api_request(m.group(1))
 
 
 def aggregate():
-    repos = list_repos()
+    repos = list(paginate(f"/orgs/{ORG}/repos", {"type": "all"}))
     print(f"found {len(repos)} repos in {ORG}", file=sys.stderr)
 
     per_author: dict[str, dict] = {}
@@ -114,27 +102,32 @@ def aggregate():
             continue
         name = repo["name"]
         print(f"  · {name}", file=sys.stderr)
-        contribs = contributors(name)
-        had_commits = False
-        for c in contribs:
-            if not c or not c.get("author"):
+
+        count = 0
+        for commit in paginate(f"/repos/{ORG}/{name}/commits"):
+            meta = commit.get("author") or {}
+            if meta.get("type") == "Bot":
                 continue
-            author = c["author"]
-            if author.get("type") == "Bot":
+            commit_author = commit.get("commit", {}).get("author") or {}
+            login = meta.get("login") or commit_author.get("name") or "unknown"
+            if login.endswith("[bot]"):
                 continue
-            login = author["login"]
+
             entry = per_author.setdefault(
                 login,
-                {"login": login, "avatar": author.get("avatar_url", ""), "total": 0},
+                {"login": login, "avatar": meta.get("avatar_url", ""), "total": 0},
             )
-            entry["total"] += c.get("total", 0)
-            total_commits += c.get("total", 0)
-            if c.get("total", 0) > 0:
-                had_commits = True
-        for w in weekly_activity(name):
-            if w and w.get("total"):
-                weekly[w["week"]] += w["total"]
-        if had_commits:
+            entry["total"] += 1
+            total_commits += 1
+            count += 1
+
+            date_str = commit_author.get("date")
+            if date_str:
+                ts = int(datetime.fromisoformat(date_str.replace("Z", "+00:00")).timestamp())
+                week_start = (ts // WEEK_SEC) * WEEK_SEC
+                weekly[week_start] += 1
+
+        if count > 0:
             active_repos += 1
 
     top = sorted(per_author.values(), key=lambda x: x["total"], reverse=True)[:TOP_N]
