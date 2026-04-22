@@ -42,10 +42,10 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- assets/commits.svg; then
+          git add assets/commits.svg
+          if git diff --cached --quiet; then
             echo "No changes."
             exit 0
           fi
-          git add assets/commits.svg
           git commit -m "chore: update commit stats ($(date -u +%Y-%m-%d))"
           git push
