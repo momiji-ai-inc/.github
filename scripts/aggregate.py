@@ -19,7 +19,18 @@ from typing import Iterator
 ORG = os.environ["ORG"]
 TOKEN = os.environ["GH_TOKEN"]
 OUTPUT = Path(os.environ.get("OUTPUT", "assets/commits.svg"))
-TOP_N = int(os.environ.get("TOP_N", "10"))
+TOP_N = int(os.environ.get("TOP_N", "6"))
+
+# Generic author emails that GitHub can misattribute to an unrelated
+# public user. Commits with these emails get bucketed under "unknown"
+# instead of being shown as the incidental matching login.
+GENERIC_EMAILS = {
+    "dev@example.com",
+    "test@example.com",
+    "user@example.com",
+    "you@example.com",
+    "root@localhost",
+}
 
 API = "https://api.github.com"
 HEADERS = {
@@ -109,7 +120,12 @@ def aggregate():
             if meta.get("type") == "Bot":
                 continue
             commit_author = commit.get("commit", {}).get("author") or {}
-            login = meta.get("login") or commit_author.get("name") or "unknown"
+            email = (commit_author.get("email") or "").lower()
+            if email in GENERIC_EMAILS:
+                login = "unknown"
+                meta = {}
+            else:
+                login = meta.get("login") or commit_author.get("name") or "unknown"
             if login.endswith("[bot]"):
                 continue
 
@@ -146,9 +162,12 @@ def aggregate():
 
 WIDTH = 860
 PAD_X = 32
-HEADER_H = 96
+HEADER_H = 82
 ROW_H = 28
 ROW_GAP = 8
+NAME_COL_W = 170
+COUNT_COL_W = 64
+BAR_GAP = 10
 BAR_SECTION_TITLE_H = 36
 WEEK_SECTION_TITLE_H = 36
 WEEK_CHART_H = 140
@@ -170,7 +189,7 @@ def render_svg(stats: dict) -> str:
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     max_count = max((a["total"] for a in top), default=1) or 1
-    bar_area_w = WIDTH - PAD_X * 2 - 200  # space for name + count
+    bar_area_w = WIDTH - PAD_X * 2 - NAME_COL_W - BAR_GAP - COUNT_COL_W
 
     parts: list[str] = []
     parts.append(
@@ -218,14 +237,9 @@ def render_svg(stats: dict) -> str:
     parts.append(
         f'<text class="title" x="{PAD_X}" y="40">{escape(ORG)} / commit activity</text>'
     )
-    subtitle = (
-        f'{stats["total_commits"]:,} commits · '
-        f'{stats["contributor_count"]} contributors · '
-        f'{stats["active_repos"]} / {stats["repo_count"]} active repos'
-    )
-    parts.append(f'<text class="subtitle" x="{PAD_X}" y="62">{escape(subtitle)}</text>')
     parts.append(
-        f'<text class="subtitle" x="{PAD_X}" y="80">Updated {escape(now)}</text>'
+        f'<text class="subtitle" x="{PAD_X}" y="62">'
+        f'{stats["total_commits"]:,} commits · updated {escape(now)}</text>'
     )
 
     # Top contributors
@@ -233,7 +247,7 @@ def render_svg(stats: dict) -> str:
     parts.append(f'<text class="section" x="{PAD_X}" y="{y + 20}">Top contributors</text>')
     y += BAR_SECTION_TITLE_H
 
-    name_col_w = 170
+    bar_x = PAD_X + NAME_COL_W
     for i, a in enumerate(top):
         ry = y + i * (ROW_H + ROW_GAP)
         name = a["login"]
@@ -242,7 +256,7 @@ def render_svg(stats: dict) -> str:
         if len(name) > 18:
             parts.append(
                 f'<text class="name" x="{PAD_X}" y="{ry + 18}" '
-                f'textLength="{name_col_w - 10}" lengthAdjust="spacingAndGlyphs">'
+                f'textLength="{NAME_COL_W - 10}" lengthAdjust="spacingAndGlyphs">'
                 f'{escape(name)}</text>'
             )
         else:
@@ -250,11 +264,11 @@ def render_svg(stats: dict) -> str:
                 f'<text class="name" x="{PAD_X}" y="{ry + 18}">{escape(name)}</text>'
             )
         parts.append(
-            f'<rect class="bar-bg" x="{PAD_X + name_col_w}" y="{ry + 6}" '
+            f'<rect class="bar-bg" x="{bar_x}" y="{ry + 6}" '
             f'width="{bar_area_w}" height="16" rx="3"/>'
         )
         parts.append(
-            f'<rect class="bar" x="{PAD_X + name_col_w}" y="{ry + 6}" '
+            f'<rect class="bar" x="{bar_x}" y="{ry + 6}" '
             f'width="{max(2, bar_w)}" height="16" rx="3"/>'
         )
         parts.append(
